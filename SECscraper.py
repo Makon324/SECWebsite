@@ -1,20 +1,23 @@
 import asyncio
 import aiohttp
 import json
+import time
 import datetime as dt
 from datetime import timezone
 from bs4 import BeautifulSoup
+from typing import Optional
 import logging
 import pandas as pd
 import numpy as np
 import re
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from collections import deque
 
 COLUMNS = [
     'X', 'Acceptance Date', 'Filing Date', 'Trade Date', 'Ticker', 'Insider Name',
     'Title', 'IsOfficer', 'IsDir', 'Is10%', 'Trade Type', 'Price', 'Qty', 'Value', 'accession_number'
 ]
+
 
 @dataclass
 class FilingInfo:
@@ -22,21 +25,24 @@ class FilingInfo:
     accession_number: str
     acceptance_datetime: dt.datetime
 
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 class SecRateLimitError(Exception):
     """Raised when the SEC says the request rate threshold has been exceeded."""
     pass
 
+
 class SECScraper():
     def __init__(self, user_agent: str):
-        self.SEC_REQUEST_DELAY = float(0.2)
-        self.last_request_time = dt.datetime.min
-        self.session: Optional[aiohttp.ClientSession] = None
+        self.MAX_REQUESTS_SEC = 9  # below 10
+        self.request_times = deque()
         self._rate_lock = asyncio.Lock()
         self._user_agent = user_agent
-        self._cik_map: Optional[Dict] = None
+        self._cik_map: Optional[dict] = None
+        self.session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession(headers={'User-Agent': self._user_agent})
@@ -52,104 +58,128 @@ class SECScraper():
             await self.session.close()
             self.session = None
 
+    async def _rate_limit_wait(self):
+        """Calculate wait time if necessary and sleep accordingly."""
+        wait_time = 0
+        async with self._rate_lock:
+            now = time.time()
+            # Remove expired timestamps
+            while self.request_times and self.request_times[0] <= now - 1:
+                self.request_times.popleft()
+
+            if len(self.request_times) >= self.MAX_REQUESTS_SEC:
+                wait_until = self.request_times[0] + 1
+                wait_time = max(0, wait_until - now)
+
+            # Reserve the slot
+            request_time = now + wait_time
+            self.request_times.append(request_time)
+
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+
     async def _make_sec_request(self, url: str, retries: int = 3) -> str:
         """Make SEC request with rate limiting and retries. Returns response text."""
         if self.session is None:
             self.session = aiohttp.ClientSession(headers={'User-Agent': self._user_agent})
 
         for attempt in range(retries):
-            async with self._rate_lock:
-                # enforce delay between calls (serializes requests)
-                elapsed = (dt.datetime.now() - self.last_request_time).total_seconds()
-                if elapsed < self.SEC_REQUEST_DELAY:
-                    await asyncio.sleep(self.SEC_REQUEST_DELAY - elapsed)
+            await self._rate_limit_wait()
 
-                try:
-                    timeout = aiohttp.ClientTimeout(total=10)
-                    self.last_request_time = dt.datetime.now()
-                    async with self.session.get(url, timeout=timeout) as resp:
-                        status = resp.status
-                        text = await resp.text()
+            try:
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with self.session.get(url, timeout=timeout) as resp:
+                    status = resp.status
+                    text = await resp.text()
 
-                        # Rate-limited
-                        if status == 429 or "Request Rate Threshold Exceeded" in text:
-                            raise SecRateLimitError()
+                    # Rate-limited
+                    if status == 429 or "Request Rate Threshold Exceeded" in text:
+                        raise SecRateLimitError()
 
-                        # Retry on server errors (5xx), but allow response.raise_for_status to raise for 4xx
-                        if 500 <= status < 600 and attempt < retries - 1:
-                            wait = 2 ** attempt
-                            logger.warning(f"Server error ({status}), retry {attempt + 1}/{retries} in {wait}s")
-                            await asyncio.sleep(wait)
-                            continue
-
-                        # will raise for 4xx client errors
-                        if status >= 400:
-                            # raise a ClientResponseError-like exception for handling upstream if needed
-                            resp.raise_for_status()
-
-                        # success: update last_request_time and return text
-                        self.last_request_time = dt.datetime.now()
-                        return text
-
-                except SecRateLimitError:
-                    logger.warning("SEC rate limit exceeded; backing off and retrying")
-                    await asyncio.sleep(5)  # backoff on rate-limit
-                    # do not raise immediately; continue to retry if attempts remain
-                    continue
-
-                except aiohttp.ClientResponseError as e:
-                    # HTTP errors (status >= 400 handled above, but keep for completeness)
-                    logger.error(f"HTTP error after {attempt + 1}/{retries}: {e}")
-                    if 500 <= getattr(e, 'status', 0) < 600 and attempt < retries - 1:
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-                    raise
-
-                except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
-                    if attempt < retries - 1:
+                    # Retry on server errors (5xx), but allow response.raise_for_status to raise for 4xx
+                    if 500 <= status < 600 and attempt < retries - 1:
                         wait = 2 ** attempt
-                        logger.warning(f"Network error, retry {attempt + 1}/{retries} in {wait}s")
+                        logger.warning(f"Server error ({status}), retry {attempt + 1}/{retries} in {wait}s")
                         await asyncio.sleep(wait)
                         continue
-                    logger.error(f"Network error after {retries} retries: {e}")
-                    raise
 
-                except aiohttp.ClientError as e:
-                    logger.error(f"Fatal request error: {e}")
-                    raise
+                    # will raise for 4xx client errors
+                    if status >= 400:
+                        # raise a ClientResponseError-like exception for handling upstream if needed
+                        resp.raise_for_status()
+
+                    # success: return text
+                    return text
+
+            except SecRateLimitError:
+                logger.warning("SEC rate limit exceeded;")
+                time.sleep(60 * 12)
+                continue
+
+            except aiohttp.ClientResponseError as e:
+                # HTTP errors (status >= 400 handled above, but keep for completeness)
+                logger.error(f"HTTP error after {attempt + 1}/{retries}: {e}")
+                if 500 <= getattr(e, 'status', 0) < 600 and attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                raise
+
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+                if attempt < retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning(f"Network error, retry {attempt + 1}/{retries} in {wait}s")
+                    await asyncio.sleep(wait)
+                    continue
+                logger.error(f"Network error after {retries} retries: {e}")
+                raise
+
+            except aiohttp.ClientError as e:
+                logger.error(f"Fatal request error: {e}")
+                raise
 
         raise RuntimeError(f"Failed to fetch {url} after {retries} attempts.")
 
-    def _init_cik_map(self) -> None:
+    async def _load_cik_map(self):
+        """Helper to fetch and build the CIK map."""
+        try:
+            text = await self._make_sec_request("https://www.sec.gov/files/company_tickers.json")
+            data = json.loads(text)
+
+            # Build lookup dicts
+            self._cik_map = {
+                'ticker_to_cik': {v['ticker'].upper(): str(v['cik_str']).zfill(10) for v in data.values()},
+                'cik_to_ticker': {str(v['cik_str']).zfill(10): v['ticker'] for v in data.values()}
+            }
+            logger.info("CIK map successfully initialized.")
+        except Exception as e:
+            logger.error(f"Failed to fetch CIK map: {str(e)}")
+            self._cik_map = {'ticker_to_cik': {}, 'cik_to_ticker': {}}
+
+    async def _init_cik_map(self):
+        """Synchronously initialize CIK map if not already loaded."""
         if self._cik_map is None:
-            try:
-                text = asyncio.run(self._make_sec_request("https://www.sec.gov/files/company_tickers.json"))
-                self._cik_map = json.loads(text)
-            except Exception as e:
-                logger.error(f"Failed to fetch CIK map: {str(e)}")
-                self._cik_map = {}  # Ensure it's not None
+            await self._load_cik_map()
 
-    def ticker_to_cik(self, ticker: str) -> str:
-        """Convert ticker to CIKs"""
-        self._init_cik_map()
+    async def ticker_to_cik(self, ticker: str) -> Optional[str]:
+        """Convert ticker to CIK."""
+        await self._init_cik_map()
+        cik = self._cik_map['ticker_to_cik'].get(ticker.upper())
+        if cik is None:
+            logger.warning(f"Could not find CIK for ticker: {ticker}")
+        return cik
 
-        # Search for ticker in SEC data
-        for entry in self._cik_map.values():
-            if entry.get('ticker') == ticker:
-                return str(entry['cik_str']).zfill(10)
+    async def cik_to_ticker(self, cik: str) -> Optional[str]:
+        """Convert CIK to ticker."""
+        await self._init_cik_map()
+        ticker = self._cik_map['cik_to_ticker'].get(str(cik).zfill(10))
+        if ticker is None:
+            logger.warning(f"Could not find ticker for CIK: {cik}")
+        return ticker
 
-        logger.warning(f"Could not find CIK for ticker: {ticker}")
-
-    def cik_to_ticker(self, cik: str) -> str:
-        """Convert ticker to CIKs"""
-        self._init_cik_map()
-
-        # Search for ticker in SEC data
-        for entry in self._cik_map.values():
-            if entry.get('cik_str') == cik:
-                return str(entry['ticker'])
-
-        logger.warning(f"Could not find ticker for CIK: {cik}")
+    async def get_ciks(self):
+        """Get list of CIKs on EDGAR.."""
+        await self._init_cik_map()
+        return list(self._cik_map['cik_to_ticker'].keys())
 
     async def scrape_filing(self, filing: FilingInfo) -> pd.DataFrame:
         """Process single SEC filing (async)"""
@@ -184,7 +214,6 @@ class SECScraper():
                 raise AttributeError("Missing ticker or owner name in filing XML.")
 
             filing_data = {
-                'X': 'D' if soup.find('derivativeTable') else '',
                 'Acceptance Date': filing.acceptance_datetime,
                 'Filing Date': filing_date,
                 'Ticker': ticker_tag.text,
@@ -261,7 +290,7 @@ class SECScraper():
         return title, is_officer, is_director, is_10_percent_owner
 
     @staticmethod
-    def _parse_transaction(transaction: BeautifulSoup, filing_data: Dict) -> Dict:
+    def _parse_transaction(transaction: BeautifulSoup, filing_data: dict) -> dict:
         """Parse individual transaction data"""
         try:
             price_elem = transaction.find('transactionPricePerShare')
@@ -288,12 +317,14 @@ class SECScraper():
 
         try:
             code_elem = transaction.find('transactionAcquiredDisposedCode')
-            code = code_elem.find('value').text if (code_elem and code_elem.find('value')) else (code_elem.text if code_elem else '')
+            code = code_elem.find('value').text if (code_elem and code_elem.find('value')) else (
+                code_elem.text if code_elem else '')
         except AttributeError:
             code = ''
 
         trade_date_tag = transaction.find('transactionDate')
-        trade_date_value = trade_date_tag.find('value').text if (trade_date_tag and trade_date_tag.find('value')) else (trade_date_tag.text if trade_date_tag else None)
+        trade_date_value = trade_date_tag.find('value').text if (trade_date_tag and trade_date_tag.find('value')) else (
+            trade_date_tag.text if trade_date_tag else None)
 
         return {
             **filing_data,
@@ -319,10 +350,10 @@ class SECScraper():
 
         # Group and aggregate
         combined_df = df.groupby(group_cols, as_index=False).agg(
-            Qty = ('Qty', 'sum'),
-            Value = ('Value', 'sum'),
-            Price = ('Price', lambda p: np.average(p, weights=df.loc[p.index, 'Qty'])
-                if df.loc[p.index, 'Qty'].sum() != 0 else p.mean())
+            Qty=('Qty', 'sum'),
+            Value=('Value', 'sum'),
+            Price=('Price', lambda p: np.average(p, weights=df.loc[p.index, 'Qty'])
+            if df.loc[p.index, 'Qty'].sum() != 0 else p.mean())
         )
 
         # Make Price always positive
@@ -357,7 +388,7 @@ class SECScraper():
 
         return dt_utc
 
-    async def get_filings(self, cik: str) -> List[FilingInfo]:
+    async def get_filings(self, cik: str) -> list[FilingInfo]:
         """Retrieve list of Form 4 filings for a CIK with acceptanceDateTime"""
         try:
             text = await self._make_sec_request(f"https://data.sec.gov/submissions/CIK{cik}.json")
@@ -378,17 +409,17 @@ class SECScraper():
             logger.error(f"Failed to get filings for CIK {cik}: {str(e)}")
             return []
 
-    async def get_current_filings(self, page: int = 0) -> List[FilingInfo]:
+    async def get_current_filings(self, page: int = 0) -> list[FilingInfo]:
         """
         Retrieve newest 100 Form 4 filings from SEC (async)
         """
         text = await self._make_sec_request(
-            f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=include&count=100&start={100*page}&output=atom"
+            f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=include&count=100&start={100 * page}&output=atom"
         )
 
         soup = BeautifulSoup(text, 'xml')
         entries = soup.find_all('entry')
-        results: List[FilingInfo] = []
+        results: list[FilingInfo] = []
 
         for entry in entries:
             link_tag = entry.find('link', rel='alternate')
