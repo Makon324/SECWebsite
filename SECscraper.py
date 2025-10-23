@@ -38,6 +38,7 @@ class SecRateLimitError(Exception):
 class SECScraper():
     def __init__(self, user_agent: str):
         self.MAX_REQUESTS_SEC = 9  # below 10
+        self.TO_WAIT_ON_RATE_LIMIT = 11 * 60  # above 10 min
         self.request_times = deque()
         self._rate_lock = asyncio.Lock()
         self._user_agent = user_agent
@@ -113,7 +114,7 @@ class SECScraper():
 
             except SecRateLimitError:
                 logger.warning("SEC rate limit exceeded;")
-                time.sleep(60 * 12)
+                time.sleep(self.TO_WAIT_ON_RATE_LIMIT)
                 continue
 
             except aiohttp.ClientResponseError as e:
