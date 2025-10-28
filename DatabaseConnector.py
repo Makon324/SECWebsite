@@ -48,7 +48,7 @@ class DatabaseConnector:
             ValueError: If conn is invalid or closed.
             asyncpg.PostgresError: On database failures.
         """
-        if conn is None or await conn.is_closed():
+        if conn is None or conn.is_closed():
             raise ValueError("conn must be an active, open asyncpg connection")
         json_data = self._df_to_json_string(df)
         async with conn.transaction():
@@ -77,7 +77,7 @@ class DatabaseConnector:
         Check if an accession number exists in the processed_filings table.
         Returns True if processed, False if not.
         """
-        if conn is None:
+        if conn is None or conn.is_closed():
             raise ValueError("conn must be an active asyncpg connection (not None)")
 
         result = await conn.fetchval(
@@ -133,7 +133,7 @@ class DatabaseConnector:
         Uses FOR UPDATE SKIP LOCKED to ensure concurrent calls get unique accession numbers.
         Returns a list of FilingInfo objects (up to n, or fewer if fewer exist).
         """
-        if conn is None:
+        if conn is None or conn.is_closed():
             raise ValueError("conn must be an active asyncpg connection (not None)")
         if n < 1:
             raise ValueError("n must be a positive integer")
