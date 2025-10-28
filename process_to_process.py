@@ -10,7 +10,7 @@ from config import Config
 
 # Configure logging with a more detailed format
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(process)d - %(name)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
