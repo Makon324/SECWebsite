@@ -10,12 +10,12 @@ import logging
 import pandas as pd
 import numpy as np
 import re
+from config import Config
 from dataclasses import dataclass
-from collections import deque
 
 COLUMNS = [
     'X', 'Acceptance Date', 'Filing Date', 'Trade Date', 'Ticker', 'Insider Name',
-    'Title', 'IsOfficer', 'IsDir', 'Is10%', 'Trade Type', 'Price', 'Qty', 'Value', 'accession_number'
+    'Title', 'IsOfficer', 'IsDir', 'Is10%', 'Trade Type', 'Price', 'Qty', 'Value'
 ]
 
 
@@ -26,8 +26,13 @@ class FilingInfo:
     acceptance_datetime: dt.datetime
 
 
-logging.basicConfig(level=logging.INFO)
+class InstantFlushHandler(logging.StreamHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 class SecRateLimitError(Exception):
@@ -36,17 +41,20 @@ class SecRateLimitError(Exception):
 
 
 class SECScraper():
-    def __init__(self, user_agent: str):
-        self.MAX_REQUESTS_SEC = 9  # below 10
-        self.TO_WAIT_ON_RATE_LIMIT = 11 * 60  # above 10 min
-        self.request_times = deque()
-        self._rate_lock = asyncio.Lock()
-        self._user_agent = user_agent
+    def __init__(self):
+        self.config = Config()
+
         self._cik_map: Optional[dict] = None
         self.session: Optional[aiohttp.ClientSession] = None
 
+        # For rate limiting
+        self._rate_lock = asyncio.Lock()
+        self._last_sec = time.time()
+        self._request_count = 0
+
+
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession(headers={'User-Agent': self._user_agent})
+        self.session = aiohttp.ClientSession(headers={'User-Agent': self.config.user_agent})
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -59,33 +67,31 @@ class SECScraper():
             await self.session.close()
             self.session = None
 
-    async def _rate_limit_wait(self):
+    async def _rate_limit(self):
         """Calculate wait time if necessary and sleep accordingly."""
-        wait_time = 0
         async with self._rate_lock:
             now = time.time()
-            # Remove expired timestamps
-            while self.request_times and self.request_times[0] <= now - 1:
-                self.request_times.popleft()
-
-            if len(self.request_times) >= self.MAX_REQUESTS_SEC:
-                wait_until = self.request_times[0] + 1
-                wait_time = max(0, wait_until - now)
-
-            # Reserve the slot
-            request_time = now + wait_time
-            self.request_times.append(request_time)
-
-        if wait_time > 0:
-            await asyncio.sleep(wait_time)
+            if now - self._last_sec >= 1:
+                self._last_sec = now
+                self._request_count = 1
+                return
+            elif self._request_count < self.config.max_requests_sec:
+                self._request_count += 1
+                return
+            else:
+                wait_time = 1 - (now - self._last_sec)
+                await asyncio.sleep(wait_time)
+                self._request_count = 1
+                self._last_sec = time.time()
+                return
 
     async def _make_sec_request(self, url: str, retries: int = 3) -> str:
         """Make SEC request with rate limiting and retries. Returns response text."""
         if self.session is None:
-            self.session = aiohttp.ClientSession(headers={'User-Agent': self._user_agent})
+            self.session = aiohttp.ClientSession(headers={'User-Agent': self.config.user_agent})
 
         for attempt in range(retries):
-            await self._rate_limit_wait()
+            await self._rate_limit()
 
             try:
                 timeout = aiohttp.ClientTimeout(total=10)
@@ -114,7 +120,7 @@ class SECScraper():
 
             except SecRateLimitError:
                 logger.warning("SEC rate limit exceeded;")
-                time.sleep(self.TO_WAIT_ON_RATE_LIMIT)
+                time.sleep(self.config.to_wait_on_rate_limit)
                 continue
 
             except aiohttp.ClientResponseError as e:
@@ -222,8 +228,7 @@ class SECScraper():
                 'Title': title,
                 'IsOfficer': is_officer,
                 'IsDir': is_director,
-                'Is10%': is_10_percent_owner,
-                'accession_number': filing.accession_number
+                'Is10%': is_10_percent_owner
             }
         except AttributeError as e:
             logger.warning(f"Missing required filing data in {filing.accession_number}: {str(e)}")
@@ -346,7 +351,7 @@ class SECScraper():
         # Define the grouping columns - these identify unique filing combinations
         group_cols = [
             'X', 'Acceptance Date', 'Filing Date', 'Ticker', 'Insider Name',
-            'Title', 'IsOfficer', 'IsDir', 'Is10%', 'accession_number', 'Trade Date', 'Trade Type'
+            'Title', 'IsOfficer', 'IsDir', 'Is10%', 'Trade Date', 'Trade Type'
         ]
 
         # Group and aggregate

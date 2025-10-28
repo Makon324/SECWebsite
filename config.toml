@@ -1,0 +1,9 @@
+user_agent = "Makon324/Test/makon324@yahoo.com"
+
+num_workers = 30
+queue_max_size = 1000
+batch_size = 500
+pool_min_size = 20
+pool_max_size = 50
+max_requests_sec = 9
+to_wait_on_rate_limit = 660

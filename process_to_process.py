@@ -1,50 +1,62 @@
 import asyncio
 import asyncpg
 import logging
-import os
-import pandas as pd
-from typing import List, Tuple
 import time
+from typing import List
 
 from SECscraper import SECScraper, FilingInfo
 from DatabaseConnector import DatabaseConnector
+from config import Config
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging with a more detailed format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(process)d - %(name)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-DSN = os.environ.get('DATABASE_URL')
-USER_AGENT = 'Makon324/test/makon324@yahoo.com'
 
-WORKERS = 30
-QUEUE_MAXSIZE = 1000
+async def process_single_filing(
+        filing: FilingInfo,
+        scraper: SECScraper,
+        db: DatabaseConnector,
+        pool: asyncpg.Pool
+) -> None:
+    """
+    Process a single filing by scraping its data and inserting it into the database.
 
+    Args:
+        filing: The FilingInfo object to process.
+        scraper: The SEC scraper instance.
+        db: The database connector.
+        pool: The connection pool.
 
-async def process_single_filing(filing: FilingInfo, scraper: SECScraper, db: DatabaseConnector, pool):
-    """Process a single filing"""
+    Raises:
+        Exception: If processing or insertion fails.
+    """
     async with pool.acquire() as conn:
         try:
             df = await scraper.scrape_filing(filing)
-            # Pass the entire filing object instead of just accession_number
             await db.insert_dataframe(conn, filing, df)
-
+            logger.debug("Processed filing: %s", filing.accession_number)
         except Exception as e:
-            logger.error(f"Failed to process filing: {filing.accession_number}, error: {e}")
-            return
+            logger.error("Failed to process filing %s: %s", filing.accession_number, e)
+            raise
 
 
 async def worker(
-    worker_id: int,
-    q: asyncio.Queue[FilingInfo | None],
-    scraper: SECScraper,
-    db: DatabaseConnector,
-    pool: asyncpg.Pool
+        worker_id: int,
+        queue: asyncio.Queue,
+        scraper: SECScraper,
+        db: DatabaseConnector,
+        pool: asyncpg.Pool
 ) -> int:
-    """Process filings from the queue until a sentinel is received.
+    """
+    Worker coroutine that processes filings from the queue until a sentinel is received.
 
     Args:
         worker_id: Unique identifier for the worker.
-        q: Queue containing FilingInfo objects or None to stop.
+        queue: Queue containing FilingInfo objects or None to stop.
         scraper: SEC scraper instance.
         db: Database connector.
         pool: Connection pool.
@@ -55,70 +67,108 @@ async def worker(
     filings_processed = 0
     while True:
         try:
-            filing = await asyncio.wait_for(q.get(), timeout=30.0)  # Prevent hangs
+            filing = await asyncio.wait_for(queue.get(), timeout=30.0)
             if filing is None:
                 break
             await process_single_filing(filing, scraper, db, pool)
             filings_processed += 1
-            logger.debug("Worker %d: Processed filing %s", worker_id, filing.accession_number)
         except asyncio.TimeoutError:
             logger.warning("Worker %d: Queue timeout, checking for shutdown", worker_id)
             continue
         except Exception as e:
-            logger.error("Worker %d: Error processing filing: %s", worker_id, e, exc_info=True)
+            logger.error("Worker %d: Error processing filing: %s", worker_id, e)
         finally:
-            q.task_done()
-    logger.info("Worker %d: Completed - Processed %d filings", worker_id, filings_processed)
+            queue.task_done()
+
+    logger.info("Worker %d completed. Processed %d filings.", worker_id, filings_processed)
     return filings_processed
 
 
-async def main():
-    """Main function to orchestrate the processing of all filings"""
-    # Create database pool with proper context management
-    async with asyncpg.create_pool(dsn=DSN, min_size=20, max_size=50) as pool:
+async def producer(
+        queue: asyncio.Queue,
+        db: DatabaseConnector,
+        pool: asyncpg.Pool
+) -> None:
+    """
+    Producer coroutine that fetches batches of filings from the database and adds them to the queue.
+
+    Args:
+        queue: The queue to put FilingInfo objects into.
+        db: The database connector.
+        pool: The connection pool.
+    """
+    config = Config()
+    while True:
+        async with pool.acquire() as conn:
+            filings: List[FilingInfo] = await db.get_to_process_filings(conn, config.batch_size)
+
+        for filing in filings:
+            await queue.put(filing)
+
+        logger.info("Queued %d filings.", len(filings))
+
+        if len(filings) < config.batch_size:
+            break
+
+    # Add sentinels for workers
+    for _ in range(config.num_workers):
+        await queue.put(None)
+
+    logger.info("Producer finished queuing all filings.")
+
+
+async def main() -> None:
+    """
+    Main coroutine to orchestrate the processing of all filings using asynchronous workers.
+    """
+    config = Config()
+    start_time = time.time()
+
+    async with asyncpg.create_pool(
+            dsn=config.database_url,
+            min_size=config.pool_min_size,
+            max_size=config.pool_max_size
+    ) as pool:
         db = DatabaseConnector()
-        async with SECScraper(user_agent=USER_AGENT) as scraper:
+
+        async with SECScraper() as scraper:
             try:
-                # Create queue
-                q: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+                queue: asyncio.Queue = asyncio.Queue(maxsize=config.queue_max_size)
 
-                async def producer():
-                    """Producer to feed FilingsInfo into the queue"""
-                    while True:
-                        async with pool.acquire() as conn:
-                            filings: FilingInfo = await db.get_to_process_filings(conn, 500)
-                        for filing in filings:
-                            await q.put(filing)
-                        if len(filings) < 500:
-                            break
+                # Start producer
+                producer_task = asyncio.create_task(producer(queue, db, pool))
 
-                    # Add sentinels to shut down workers
-                    for _ in range(WORKERS):
-                        await q.put(None)
-                    logger.info("Producer finished queueing all to_process")
+                # Start workers
+                worker_tasks = [
+                    asyncio.create_task(worker(i, queue, scraper, db, pool))
+                    for i in range(1, config.num_workers + 1)
+                ]
 
-                # Start workers and producer
-                workers = [asyncio.create_task(worker(i, q, scraper, db, pool))
-                           for i in range(WORKERS)]
-                producer_task = asyncio.create_task(producer())
+                # Wait for queue to be fully processed
+                await queue.join()
 
-                # Wait for all tasks to complete
-                await q.join()
+                # Wait for producer to finish
                 await producer_task
 
                 # Gather results from workers
-                results = await asyncio.gather(*workers, return_exceptions=True)
+                results = await asyncio.gather(*worker_tasks, return_exceptions=True)
 
-                # Process results
-                pass
+                # Log total processed filings
+                total_processed = sum(r for r in results if isinstance(r, int))
+                logger.info("All workers completed. Total filings processed: %d", total_processed)
+
+                # Handle any exceptions from workers
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.error("Worker exception: %s", result)
 
             except Exception as e:
-                logger.error(f"Failed in main process: {str(e)}")
+                logger.error("Main process failed: %s", e)
                 raise
+            finally:
+                end_time = time.time()
+                logger.info("Total execution time: %.2f seconds", end_time - start_time)
 
 
 if __name__ == "__main__":
-    start_time = time.time()
     asyncio.run(main())
-    end_time = time.time()
-    logger.info("Total execution time: %.2f seconds", end_time - start_time)
