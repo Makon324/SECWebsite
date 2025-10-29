@@ -1,17 +1,19 @@
 import asyncio
-import aiohttp
-import json
-import time
 import datetime as dt
-from datetime import timezone
-from bs4 import BeautifulSoup
-from typing import Optional
+import json
 import logging
-import pandas as pd
-import numpy as np
 import re
-from config import Config
+import time
+from datetime import timezone
+from typing import Optional
+
+import aiohttp
+import numpy as np
+import pandas as pd
+from bs4 import BeautifulSoup
 from dataclasses import dataclass
+
+from config import Config
 
 COLUMNS = [
     'X', 'Acceptance Date', 'Filing Date', 'Trade Date', 'Ticker', 'Insider Name',
@@ -27,21 +29,22 @@ class FilingInfo:
 
 
 class InstantFlushHandler(logging.StreamHandler):
+    """Custom logging handler that flushes immediately after emitting a record."""
+
     def emit(self, record):
         super().emit(record)
         self.flush()
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 
-class SecRateLimitError(Exception):
-    """Raised when the SEC says the request rate threshold has been exceeded."""
-    pass
+class SECScraper:
+    """Class for scraping SEC filings, particularly Form 4 insider trades."""
 
-
-class SECScraper():
     def __init__(self):
+        """Initialize the SECScraper instance."""
         self.config = Config()
 
         self._cik_map: Optional[dict] = None
@@ -52,23 +55,25 @@ class SECScraper():
         self._last_sec = time.time()
         self._request_count = 0
 
-
     async def __aenter__(self):
+        """Enter the async context manager."""
         self.session = aiohttp.ClientSession(headers={'User-Agent': self.config.user_agent})
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        """Exit the async context manager."""
         if self.session:
             await self.session.close()
             self.session = None
 
     async def close(self):
+        """Close the client session if it exists."""
         if self.session:
             await self.session.close()
             self.session = None
 
     async def _rate_limit(self):
-        """Calculate wait time if necessary and sleep accordingly."""
+        """Calculate wait time if necessary and sleep accordingly to enforce rate limits."""
         async with self._rate_lock:
             now = time.time()
             if now - self._last_sec >= 1:
@@ -86,7 +91,20 @@ class SECScraper():
                 return
 
     async def _make_sec_request(self, url: str, retries: int = 3) -> str:
-        """Make SEC request with rate limiting and retries. Returns response text."""
+        """
+        Make SEC request with rate limiting and retries. Returns response text.
+
+        Args:
+            url (str): The URL to request.
+            retries (int, optional): Number of retry attempts. Defaults to 3.
+
+        Returns:
+            str: The response text.
+
+        Raises:
+            RuntimeError: If the request fails after all retries.
+            aiohttp.ClientError: On client-side errors.
+        """
         if self.session is None:
             self.session = aiohttp.ClientSession(headers={'User-Agent': self.config.user_agent})
 
@@ -163,12 +181,20 @@ class SECScraper():
             self._cik_map = {'ticker_to_cik': {}, 'cik_to_ticker': {}}
 
     async def _init_cik_map(self):
-        """Synchronously initialize CIK map if not already loaded."""
+        """Initialize CIK map if not already loaded."""
         if self._cik_map is None:
             await self._load_cik_map()
 
     async def ticker_to_cik(self, ticker: str) -> Optional[str]:
-        """Convert ticker to CIK."""
+        """
+        Convert ticker to CIK.
+
+        Args:
+            ticker (str): The stock ticker symbol.
+
+        Returns:
+            Optional[str]: The corresponding CIK, or None if not found.
+        """
         await self._init_cik_map()
         cik = self._cik_map['ticker_to_cik'].get(ticker.upper())
         if cik is None:
@@ -176,7 +202,15 @@ class SECScraper():
         return cik
 
     async def cik_to_ticker(self, cik: str) -> Optional[str]:
-        """Convert CIK to ticker."""
+        """
+        Convert CIK to ticker.
+
+        Args:
+            cik (str): The CIK number.
+
+        Returns:
+            Optional[str]: The corresponding ticker, or None if not found.
+        """
         await self._init_cik_map()
         ticker = self._cik_map['cik_to_ticker'].get(str(cik).zfill(10))
         if ticker is None:
@@ -184,12 +218,25 @@ class SECScraper():
         return ticker
 
     async def get_ciks(self):
-        """Get list of CIKs on EDGAR.."""
+        """
+        Get list of CIKs on EDGAR.
+
+        Returns:
+            list[str]: List of CIKs.
+        """
         await self._init_cik_map()
         return list(self._cik_map['cik_to_ticker'].keys())
 
     async def scrape_filing(self, filing: FilingInfo) -> pd.DataFrame:
-        """Process single SEC filing (async)"""
+        """
+        Process single SEC filing (async).
+
+        Args:
+            filing (FilingInfo): The filing information to scrape.
+
+        Returns:
+            pd.DataFrame: DataFrame containing the parsed transaction data.
+        """
         url = (f"https://www.sec.gov/Archives/edgar/data/"
                f"{filing.cik}/{filing.accession_number.replace('-', '')}/{filing.accession_number}.txt")
 
@@ -261,7 +308,15 @@ class SECScraper():
 
     @staticmethod
     def _extract_title(soup: BeautifulSoup) -> tuple:
-        """Extract and format insider title along with boolean flags"""
+        """
+        Extract and format insider title along with boolean flags.
+
+        Args:
+            soup (BeautifulSoup): The parsed XML soup.
+
+        Returns:
+            tuple: (title, is_officer, is_director, is_10_percent_owner)
+        """
         relationship = soup.find('reportingOwnerRelationship')
         title_parts = []
         is_officer = False
@@ -297,7 +352,16 @@ class SECScraper():
 
     @staticmethod
     def _parse_transaction(transaction: BeautifulSoup, filing_data: dict) -> dict:
-        """Parse individual transaction data"""
+        """
+        Parse individual transaction data.
+
+        Args:
+            transaction (BeautifulSoup): The transaction XML element.
+            filing_data (dict): Common filing data.
+
+        Returns:
+            dict: Parsed transaction details.
+        """
         try:
             price_elem = transaction.find('transactionPricePerShare')
             # sometimes price is nested with <value> tag, sometimes not
@@ -344,7 +408,15 @@ class SECScraper():
 
     @staticmethod
     def _combine_records(df: pd.DataFrame) -> pd.DataFrame:
-        """Combine transactions from a single filing to reduce duplicate entries."""
+        """
+        Combine transactions from a single filing to reduce duplicate entries.
+
+        Args:
+            df (pd.DataFrame): DataFrame of transactions.
+
+        Returns:
+            pd.DataFrame: Combined DataFrame.
+        """
         if df.empty:
             return df
 
@@ -375,6 +447,12 @@ class SECScraper():
         """
         Parse an ISO-8601 date string (with fractional seconds or offset/Z)
         and return a UTC datetime (timezone-aware).
+
+        Args:
+            dt_obj (str): The date string to parse.
+
+        Returns:
+            dt.datetime: Parsed datetime in UTC.
         """
         # Decide which format to use
         if '.' in dt_obj:
@@ -395,7 +473,15 @@ class SECScraper():
         return dt_utc
 
     async def get_filings(self, cik: str) -> list[FilingInfo]:
-        """Retrieve list of Form 4 filings for a CIK with acceptanceDateTime"""
+        """
+        Retrieve list of Form 4 filings for a CIK with acceptanceDateTime.
+
+        Args:
+            cik (str): The CIK number.
+
+        Returns:
+            list[FilingInfo]: List of Form 4 filings.
+        """
         try:
             text = await self._make_sec_request(f"https://data.sec.gov/submissions/CIK{cik}.json")
             data = json.loads(text)
@@ -417,7 +503,13 @@ class SECScraper():
 
     async def get_current_filings(self, page: int = 0) -> list[FilingInfo]:
         """
-        Retrieve newest 100 Form 4 filings from SEC (async)
+        Retrieve newest 100 Form 4 filings from SEC (async).
+
+        Args:
+            page (int, optional): Page number for pagination. Defaults to 0.
+
+        Returns:
+            list[FilingInfo]: List of recent Form 4 filings.
         """
         text = await self._make_sec_request(
             f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=include&count=100&start={100 * page}&output=atom"
@@ -458,3 +550,8 @@ class SECScraper():
             )
 
         return results
+
+
+class SecRateLimitError(Exception):
+    """Raised when the SEC says the request rate threshold has been exceeded."""
+    pass
