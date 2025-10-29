@@ -6,7 +6,7 @@ import re
 import time
 from datetime import timezone
 from typing import Optional
-
+from collections import deque
 import aiohttp
 import numpy as np
 import pandas as pd
@@ -52,8 +52,7 @@ class SECScraper:
 
         # For rate limiting
         self._rate_lock = asyncio.Lock()
-        self._last_sec = time.time()
-        self._request_count = 0
+        self._request_times = deque(maxlen=self.config.max_requests_sec)
 
     async def __aenter__(self):
         """Enter the async context manager."""
@@ -73,22 +72,23 @@ class SECScraper:
             self.session = None
 
     async def _rate_limit(self):
-        """Calculate wait time if necessary and sleep accordingly to enforce rate limits."""
         async with self._rate_lock:
             now = time.time()
-            if now - self._last_sec >= 1:
-                self._last_sec = now
-                self._request_count = 1
-                return
-            elif self._request_count < self.config.max_requests_sec:
-                self._request_count += 1
-                return
-            else:
-                wait_time = 1 - (now - self._last_sec)
-                await asyncio.sleep(wait_time)
-                self._request_count = 1
-                self._last_sec = time.time()
-                return
+
+            # Prune timestamps older than 1 second (left is oldest)
+            while self._request_times and self._request_times[0] <= now - 1:
+                self._request_times.popleft()
+
+            # If at limit, wait until the oldest ages out
+            if len(self._request_times) >= self.config.max_requests_sec:
+                wait_time = (self._request_times[0] + 1) - now
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
+
+                    # After sleep, update now and re-prune (in case of drift)
+                    now = time.time()
+                    while self._request_times and self._request_times[0] <= now - 1:
+                        self._request_times.popleft()
 
     async def _make_sec_request(self, url: str, retries: int = 3) -> str:
         """
