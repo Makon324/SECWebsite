@@ -2,10 +2,25 @@ import toml
 import boto3
 from botocore.exceptions import ClientError
 import json
+from threading import Lock
 
 
 class Config:
+    _instance = None
+    _lock = Lock()  # For thread-safe initialization
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(Config, cls).__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self):
+        if self._initialized:
+            return
+
         self.user_agent = None
         self.num_workers = None
         self.queue_max_size = None
@@ -19,26 +34,10 @@ class Config:
         self.load_from_toml("config.toml")
         self.load_db_url()
 
+        self._initialized = True
+
     def load_from_toml(self, file_path):
-        """
-        Loads configuration variables from a .toml file.
-
-        Args:
-            file_path (str): Path to the .toml configuration file.
-
-        The .toml file should contain the following keys:
-        user_agent = "Makon324/test/makon324@yahoo.com"
-        num_workers = 30
-        queue_max_size = 1000
-        batch_size = 500
-        pool_min_size = 20
-        pool_max_size = 50
-
-        Example usage:
-            config = Config()
-            config.load_from_toml('config.toml')
-            print(config.user_agent)
-        """
+        """Loads configuration variables from a .toml file."""
         try:
             with open(file_path, 'r') as f:
                 data = toml.load(f)
@@ -60,13 +59,7 @@ class Config:
             raise ValueError(f"Error loading config: {str(e)}")
 
     def load_db_url(self):
-        """
-        Constructs a database URL from the given configuration dictionary.
-
-        :param db_config: A dictionary containing database connection details.
-                          Expected keys: 'username', 'password', 'engine', 'host', 'port', 'dbInstanceIdentifier'
-        :return: A string representing the database URL.
-        """
+        """Constructs a database URL from AWS secret.."""
         db_config = json.loads(self.get_secret("filingsdatabase_secrets"))
 
         engine = db_config.get('engine', 'postgresql')  # Default to 'postgresql' for standard compatibility
@@ -83,6 +76,7 @@ class Config:
         self.database_url = f"{engine}://{username}:{password}@{host}:{port}/{db_name}"
 
     def get_secret(self, secret_name: str, region_name: str = "eu-north-1"):
+        """Get secret from AWS secret."""
         # Create a Secrets Manager client
         session = boto3.session.Session()
         client = session.client(
