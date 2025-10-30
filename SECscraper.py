@@ -72,6 +72,7 @@ class SECScraper:
             self.session = None
 
     async def _rate_limit(self):
+        """Called before each request to comply with SECs rate limit."""
         async with self._rate_lock:
             now = time.time()
 
@@ -89,6 +90,8 @@ class SECScraper:
                     now = time.time()
                     while self._request_times and self._request_times[0] <= now - 1:
                         self._request_times.popleft()
+
+            self._request_times.append(now)
 
     async def _make_sec_request(self, url: str, retries: int = 3) -> str:
         """
