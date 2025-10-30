@@ -3,6 +3,23 @@ import boto3
 from botocore.exceptions import ClientError
 import json
 from threading import Lock
+import logging
+import sys
+
+
+def setup_logging(level=logging.INFO):
+    """Setup logging configuration."""
+    if logging.getLogger().hasHandlers():
+        return
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(process)d - %(name)s - %(message)s'
+    ))
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    root_logger.addHandler(handler)
 
 
 class Config:

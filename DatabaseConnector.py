@@ -6,10 +6,8 @@ from SECscraper import FilingInfo
 import asyncpg  # for type hints
 from asyncpg.exceptions import IntegrityError, PostgresError
 
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
 
 class DatabaseConnector:
     """

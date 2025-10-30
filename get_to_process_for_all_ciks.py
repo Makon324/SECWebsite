@@ -4,16 +4,11 @@ import logging
 import os
 from typing import List, Tuple
 import time
-from config import Config
+from config import Config, setup_logging
 
 from SECscraper import SECScraper, FilingInfo
 from DatabaseConnector import DatabaseConnector
 
-# Configure logging with a more detailed format
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 
@@ -179,4 +174,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    setup_logging()
     asyncio.run(main())

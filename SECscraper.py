@@ -15,6 +15,8 @@ from dataclasses import dataclass
 
 from config import Config
 
+logger = logging.getLogger(__name__)
+
 COLUMNS = [
     'X', 'Acceptance Date', 'Filing Date', 'Trade Date', 'Ticker', 'Insider Name',
     'Title', 'IsOfficer', 'IsDir', 'Is10%', 'Trade Type', 'Price', 'Qty', 'Value'
@@ -34,10 +36,6 @@ class InstantFlushHandler(logging.StreamHandler):
     def emit(self, record):
         super().emit(record)
         self.flush()
-
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 
 class SECScraper:

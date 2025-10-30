@@ -6,13 +6,8 @@ from typing import List
 
 from SECscraper import SECScraper, FilingInfo
 from DatabaseConnector import DatabaseConnector
-from config import Config
+from config import Config, setup_logging
 
-# Configure logging with a more detailed format
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(process)d - %(name)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 
@@ -38,7 +33,7 @@ async def process_single_filing(
         try:
             df = await scraper.scrape_filing(filing)
             await db.insert_dataframe(conn, filing, df)
-            logger.debug("Processed filing: %s", filing.accession_number)
+            logger.info("Processed filing: %s", filing.accession_number)
         except Exception as e:
             logger.error("Failed to process filing %s: %s", filing.accession_number, e)
             raise
@@ -171,4 +166,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    setup_logging()
     asyncio.run(main())
