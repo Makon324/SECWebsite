@@ -33,7 +33,7 @@ CREATE TABLE sec_filing_transactions (
 
     -- price and value: two decimal places (cents)
     price NUMERIC(14,2),
-    qty INTEGER,
+    qty BIGINT,
     value NUMERIC(18,2),
 
     -- housekeeping
@@ -50,12 +50,18 @@ CREATE TABLE processed_filings (
 );
 
 
+CREATE TYPE job_status AS ENUM ('pending', 'in_progress');
+
 -- Table to store accession numbers to be processed with all FilingInfo fields
 CREATE TABLE to_process (
     cik VARCHAR(10) NOT NULL,
     accession_number VARCHAR(64) PRIMARY KEY,
+    status job_status NOT NULL DEFAULT 'pending',
     acceptance_datetime TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE INDEX idx_to_process_status_created 
+ON to_process (status, created_at);
 
 

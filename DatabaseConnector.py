@@ -143,25 +143,47 @@ class DatabaseConnector:
         if n < 1:
             raise ValueError("n must be a positive integer")
 
-        async with conn.transaction():
-            # Select up to n rows, locking them and skipping already locked rows
-            records = await conn.fetch(
-                """
-                SELECT cik, accession_number, acceptance_datetime
-                FROM to_process
-                ORDER BY created_at ASC
+            # No extra transaction; query is atomic
+        records = await conn.fetch(
+            """
+            WITH next_filings AS (SELECT accession_number
+                                  FROM to_process
+                                  WHERE status = 'pending'
+                                  ORDER BY created_at ASC
                 LIMIT $1
-                FOR UPDATE SKIP LOCKED;
-                """,
-                n
-            )
-            # Convert records to FilingInfo objects
-            filing_infos = [
-                FilingInfo(
-                    cik=record["cik"],
-                    accession_number=record["accession_number"],
-                    acceptance_datetime=record["acceptance_datetime"]
+                FOR
+            UPDATE SKIP LOCKED
                 )
-                for record in records
-            ]
-            return filing_infos
+            UPDATE to_process
+            SET status      = 'in_progress'
+            FROM next_filings
+            WHERE to_process.accession_number = next_filings.accession_number
+                RETURNING to_process.cik
+                , to_process.accession_number
+                , to_process.acceptance_datetime;
+            """,
+            n
+        )
+        # Convert records to FilingInfo objects
+        filing_infos = [
+            FilingInfo(
+                cik=record["cik"],
+                accession_number=record["accession_number"],
+                acceptance_datetime=record["acceptance_datetime"]
+            )
+            for record in records
+        ]
+        return filing_infos
+
+    async def reset_to_pending(self, conn: asyncpg.Connection):
+        """Reset all rows in the to_process table to 'pending' status."""
+        if conn is None or conn.is_closed():
+            raise ValueError("conn must be an active asyncpg connection (not None)")
+
+        await conn.execute(
+            """
+            UPDATE to_process
+            SET status = 'pending'
+            WHERE status != 'pending';
+            """
+        )
