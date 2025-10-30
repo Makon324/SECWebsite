@@ -74,6 +74,15 @@ class SECScraper:
         async with self._rate_lock:
             now = time.time()
 
+            # Add min time between requests
+            interval = 1.0 / self.config.max_requests_sec
+            if self._request_times:
+                last = self._request_times[-1]
+                wait = interval - (now - last)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                    now = time.time()
+
             # Prune timestamps older than 1 second (left is oldest)
             while self._request_times and self._request_times[0] <= now - 1:
                 self._request_times.popleft()
