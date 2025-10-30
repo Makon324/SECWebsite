@@ -4,6 +4,7 @@ import pandas as pd
 import logging
 from SECscraper import FilingInfo
 import asyncpg  # for type hints
+from asyncpg.exceptions import IntegrityError, PostgresError
 
 
 # Configure logging
@@ -46,6 +47,7 @@ class DatabaseConnector:
 
         Raises:
             ValueError: If conn is invalid or closed.
+            asyncpg.IntegrityError: If insert fails.
             asyncpg.PostgresError: On database failures.
         """
         if conn is None or conn.is_closed():
