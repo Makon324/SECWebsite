@@ -4,7 +4,6 @@ import pandas as pd
 import logging
 from SECscraper import FilingInfo
 import asyncpg  # for type hints
-from asyncpg.exceptions import IntegrityError, PostgresError
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +64,14 @@ class DatabaseConnector:
                     "DELETE FROM to_process WHERE accession_number = $1;",
                     filing.accession_number
                 )
-            except asyncpg.IntegrityError as e:
-                logger.error("Integrity violation for accession %s: %s", filing.accession_number, e)
+
+            except (asyncpg.UniqueViolationError,
+                    asyncpg.ForeignKeyViolationError,
+                    asyncpg.NotNullViolationError,
+                    asyncpg.CheckViolationError,
+                    asyncpg.ExclusionViolationError) as e:
+                logger.error("Integrity/constraint violation for accession %s: %s",
+                         filing.accession_number, e, exc_info=True)
                 raise
             except asyncpg.PostgresError as e:
                 logger.critical("Database error: %s", e, exc_info=True)
